@@ -1,5 +1,5 @@
 ---
-# yaml-language-server: $schema=https://raw.githubusercontent.com/bjw-s-labs/helm-charts/common-4.4.0/charts/library/common/values.schema.json
+# yaml-language-server: $schema=https://raw.githubusercontent.com/bjw-s-labs/helm-charts/common-5.0.1/charts/library/common/values.schema.json
 
 global:
   fullnameOverride: direwolf
@@ -17,6 +17,37 @@ defaultPodOptions:
     runAsGroup: 100
     fsGroup: 100
     fsGroupChangePolicy: OnRootMismatch
+
+configMaps:
+  wolf-root:
+    forceRename: wolf-root
+    data:
+      # Shadows the GOW base-image /entrypoint.sh in the wolf sidecar (mounted via
+      # the alex User's volumes + sidecarPolicies.wolf.volumeMounts). The stock
+      # entrypoint runs the cont-init.d scripts and then gosu's to ${UNAME}, and the
+      # operator hardcodes PUID=1000/UNAME=ubuntu -- but wolf's supervisord.conf has
+      # user=root, so a non-root supervisord dies with "Can't drop privilege as
+      # nonroot user". This wrapper keeps the init-script behavior but forces root
+      # and execs the startup script without dropping privileges.
+      entrypoint.sh: |
+        #!/usr/bin/env bash
+        set -e
+
+        source /opt/gow/bash-lib/utils.sh
+
+        # Force root: 10-setup_user.sh becomes a no-op and we never gosu.
+        export UNAME=root PUID=0 PGID=0 HOME=/root
+
+        for init_script in /etc/cont-init.d/*.sh; do
+          gow_log
+          gow_log "[ ${init_script}: executing... ]"
+          # shellcheck source=/dev/null
+          source "${init_script}"
+        done
+
+        gow_log "Launching the container's startup script as root"
+        chmod +x /opt/gow/startup.sh
+        exec /opt/gow/startup.sh
 
 controllers:
   direwolf_operator:
@@ -96,8 +127,8 @@ service:
     controller: moonlight_proxy
     type: LoadBalancer
     annotations:
-      lbipam.cilium.io/sharing-key: direwolf
-      "metallb.universe.tf/allow-shared-ip": "direwolf"
+      lbipam.cilium.io/sharing-key: "{{ .Release.Namespace }}"
+      metallb.universe.tf/allow-shared-ip: "{{ .Release.Namespace }}"
     ports:
       http:
         protocol: TCP
@@ -164,16 +195,16 @@ rbac:
 rawResources:
   # Create a selfsigned Issuer, in order to create a root CA certificate for signing certificates
   self-signed-issuer:
-    apiVersion: cert-manager.io/v1
-    kind: Issuer
-    spec:
+    manifest:
+      apiVersion: cert-manager.io/v1
+      kind: Issuer
       spec:
         selfSigned: {}
   # Generate a CA Certificate used to sign certificates
   ca-cert:
-    apiVersion: cert-manager.io/v1
-    kind: Certificate
-    spec:
+    manifest:
+      apiVersion: cert-manager.io/v1
+      kind: Certificate
       spec:
         secretName: '{{ include "bjw-s.common.lib.chart.names.fullname" $ }}-ca'
         duration: 43800h # 5y
@@ -184,17 +215,17 @@ rawResources:
         isCA: true
   # Create an Issuer that uses the above generated CA certificate to issue certs
   ca-issuer:
-    apiVersion: cert-manager.io/v1
-    kind: Issuer
-    spec:
+    manifest:
+      apiVersion: cert-manager.io/v1
+      kind: Issuer
       spec:
         ca:
           secretName: '{{ include "bjw-s.common.lib.chart.names.fullname" $ }}-ca'
 # Finally, generate a serving certificate for the direwolf to use
   cert:
-    apiVersion: cert-manager.io/v1
-    kind: Certificate
-    spec:
+    manifest:
+      apiVersion: cert-manager.io/v1
+      kind: Certificate
       spec:
         secretName: '{{ include "bjw-s.common.lib.chart.names.fullname" $ }}-tls'
         duration: 8760h # 1y
@@ -205,3 +236,63 @@ rawResources:
         - '{{ include "bjw-s.common.lib.chart.names.fullname" $ }}'
         - '{{ include "bjw-s.common.lib.chart.names.fullname" $ }}.{{ .Release.Namespace }}'
         - '{{ include "bjw-s.common.lib.chart.names.fullname" $ }}.{{ .Release.Namespace }}.svc'
+  # The direwolf Moonlight LoadBalancer Services (the moonlight-proxy Service and
+  # every per-session "<user>-<app>-<id>-rtp" Service) all share one LB IP via
+  # lbipam.cilium.io/sharing-key: {{ .Release.Namespace }}, which forces
+  # externalTrafficPolicy: Cluster (Cilium won't share an IP across Local-policy
+  # Services with different pod selectors -- cilium/cilium#38766). Cluster policy
+  # means the LB IP is advertised from every node, so Moonlight's high-bitrate
+  # UDP video can land on a non-GPU node and get SNAT-hairpinned to nv-01,
+  # showing up as packet loss.
+  #
+  # This policy opts those Services into DSR (service.cilium.io/forwarding-mode)
+  # so the host->client video return path egresses directly from the backend
+  # node (nv-01) with no extra hop or SNAT, while keeping the shared IP and
+  # Cluster policy intact (an annotation does not affect LB-IPAM sharing).
+  # Requires bpf.lbModeAnnotation=true + loadBalancer.dsrDispatch on Cilium.
+  #
+  # The annotation must be present at Service creation, so it is injected at
+  # admission. Operator-created RTP Services are created fresh per session; the
+  # long-lived proxy Service must be recreated once after this policy is applied
+  # so it too is admitted with the annotation.
+  dsr-policy:
+    forceRename: direwolf-dsr
+    manifest:
+      apiVersion: admissionregistration.k8s.io/v1
+      kind: MutatingAdmissionPolicy
+      spec:
+        failurePolicy: Fail
+        matchConstraints:
+          resourceRules:
+            - apiGroups: [""]
+              apiVersions: ["v1"]
+              operations: ["CREATE", "UPDATE"]
+              resources: ["services"]
+        matchConditions:
+          - name: in-namespace
+            expression: "object.metadata.namespace == '{{ .Release.Namespace }}'"
+          - name: is-loadbalancer
+            expression: "object.spec.type == 'LoadBalancer'"
+          - name: is-direwolf-shared
+            expression: >
+              has(object.metadata.annotations) &&
+              'lbipam.cilium.io/sharing-key' in object.metadata.annotations &&
+              object.metadata.annotations['lbipam.cilium.io/sharing-key'] == '{{ .Release.Namespace }}'
+        reinvocationPolicy: IfNeeded
+        mutations:
+          - patchType: ApplyConfiguration
+            applyConfiguration:
+              expression: >
+                Object{
+                  metadata: Object.metadata{
+                    annotations: {"service.cilium.io/forwarding-mode": "dsr"}
+                  }
+                }
+  direwolf-dsr-binding:
+    forceRename: direwolf-dsr
+    manifest:
+      apiVersion: admissionregistration.k8s.io/v1
+      kind: MutatingAdmissionPolicyBinding
+      spec:
+        policyName: direwolf-dsr
+        matchResources: {}
